@@ -10,7 +10,7 @@ Default grid follows the project requirements:
   - Activations: relu, sigmoid, tanh
   - Batch sizes: 32, 64, 128, 256, 512
   - Processes: 1, 2, 4, 8
-  - Fixed: hidden=32, lr=1e-3, iters=5000
+  - Fixed: iters=5000 (others vary by activation)
 
 Usage example:
   python run_experiments.py \
@@ -19,7 +19,7 @@ Usage example:
     --procs 1 2 4 8 \
     --activations relu sigmoid tanh \
     --batches 32 64 128 256 512 \
-    --hidden 32 --lr 0.001 --iters 5000 --resume
+    --iters 5000 --resume
 """
 
 from __future__ import annotations
@@ -73,6 +73,47 @@ def default_grid() -> Tuple[List[str], List[int], List[int]]:
     batches = [32, 64, 128, 256, 512]
     procs = [1, 2, 4, 8]
     return activations, batches, procs
+
+
+def activation_defaults(act: str) -> Dict[str, object]:
+    """Per-activation baseline hyperparameters.
+
+    - tanh:    hidden=512,  lr=1.5e-3, weight_decay=2e-4, lr_decay=0.5, lr_decay_steps=1200
+    - relu:    hidden=128,  lr=1e-3,   weight_decay=1e-5, lr_decay=1.0, lr_decay_steps=0
+    - sigmoid: hidden=256,  lr=5e-4,   weight_decay=2e-4, lr_decay=1.0, lr_decay_steps=0
+    """
+    if act == "tanh":
+        return {
+            "hidden": 512,
+            "lr": 1.5e-3,
+            "weight_decay": 2e-4,
+            "lr_decay": 0.5,
+            "lr_decay_steps": 1200,
+        }
+    if act == "relu":
+        return {
+            "hidden": 128,
+            "lr": 1e-3,
+            "weight_decay": 1e-5,
+            "lr_decay": 1.0,
+            "lr_decay_steps": 0,
+        }
+    if act == "sigmoid":
+        return {
+            "hidden": 256,
+            "lr": 5e-4,
+            "weight_decay": 2e-4,
+            "lr_decay": 1.0,
+            "lr_decay_steps": 0,
+        }
+    # Fallback
+    return {
+        "hidden": 128,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "lr_decay": 1.0,
+        "lr_decay_steps": 0,
+    }
 
 
 def run_cmd(cmd: List[str], log_path: Path, env: Optional[Dict[str, str]] = None) -> int:
@@ -165,17 +206,19 @@ class RunConfig:
     activations: List[str]
     batches: List[int]
     procs: List[int]
-    hidden: int
-    lr: float
+    hidden: Optional[int]
+    lr: Optional[float]
+    lr_decay: Optional[float]
+    lr_decay_steps: Optional[int]
     iters: int
     eval_every: int
     seed: int
     dtype: str
     standardize_y: bool
     log1p_y: bool
-    weight_decay: float
+    weight_decay: Optional[float]
     grad_clip: float
-    loss_clip: float
+    loss_clip: Optional[float]
     resume: bool
 
 
@@ -189,14 +232,25 @@ def run_one(cfg: RunConfig, launcher: str, act: str, batch: int, procs: int) -> 
     if cfg.resume and json_path.exists():
         return 0, json_path, log_path
 
+    # Derive effective hyperparameters: per-activation policy overridden by CLI if provided
+    policy = activation_defaults(act)
+    hidden = cfg.hidden if cfg.hidden is not None else int(policy["hidden"])
+    lr = cfg.lr if cfg.lr is not None else float(policy["lr"])
+    weight_decay = cfg.weight_decay if cfg.weight_decay is not None else float(policy["weight_decay"])
+    lr_decay = cfg.lr_decay if cfg.lr_decay is not None else float(policy["lr_decay"])
+    lr_decay_steps = cfg.lr_decay_steps if cfg.lr_decay_steps is not None else int(policy["lr_decay_steps"])
+    loss_clip = cfg.loss_clip if cfg.loss_clip is not None else 9.0
+
     # Build command
     base_cmd = [
         launcher, "-n", str(procs), sys.executable, "mpi_nn_train.py",
         "--data-dir", str(cfg.data_dir),
         "--activation", act,
-        "--hidden", str(cfg.hidden),
+        "--hidden", str(hidden),
         "--batch", str(batch),
-        "--lr", str(cfg.lr),
+        "--lr", str(lr),
+        "--lr-decay", str(lr_decay),
+        "--lr-decay-steps", str(lr_decay_steps),
         "--iters", str(cfg.iters),
         "--eval-every", str(cfg.eval_every),
         "--seed", str(cfg.seed),
@@ -208,12 +262,12 @@ def run_one(cfg: RunConfig, launcher: str, act: str, batch: int, procs: int) -> 
         base_cmd.append("--standardize-y")
     if cfg.log1p_y:
         base_cmd.append("--log1p-y")
-    if cfg.weight_decay and cfg.weight_decay > 0:
-        base_cmd += ["--weight-decay", str(cfg.weight_decay)]
+    if weight_decay and weight_decay > 0:
+        base_cmd += ["--weight-decay", str(weight_decay)]
     if cfg.grad_clip and cfg.grad_clip > 0:
         base_cmd += ["--grad-clip", str(cfg.grad_clip)]
-    if cfg.loss_clip and cfg.loss_clip > 0:
-        base_cmd += ["--loss-clip", str(cfg.loss_clip)]
+    if loss_clip and loss_clip > 0:
+        base_cmd += ["--loss-clip", str(loss_clip)]
 
     rc = run_cmd(base_cmd, log_path)
     return rc, json_path, log_path
@@ -226,17 +280,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--activations", nargs="*", default=["relu", "sigmoid", "tanh"], help="Activation choices")
     parser.add_argument("--batches", nargs="*", type=int, default=[32, 64, 128, 256, 512], help="Batch sizes")
     parser.add_argument("--procs", nargs="*", type=int, default=[1, 2, 4, 8], help="MPI process counts")
-    parser.add_argument("--hidden", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    # None defaults allow per-activation policy to take effect
+    parser.add_argument("--hidden", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lr-decay", type=float, default=None)
+    parser.add_argument("--lr-decay-steps", type=int, default=None)
     parser.add_argument("--iters", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dtype", choices=["float32", "float64"], default="float64")
-    parser.add_argument("--standardize-y", action="store_true")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
+    parser.add_argument("--standardize-y", action="store_true", default=True)
     parser.add_argument("--log1p-y", action="store_true")
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip", type=float, default=0.0)
-    parser.add_argument("--loss-clip", type=float, default=0.0)
+    parser.add_argument("--loss-clip", type=float, default=9.0)
     parser.add_argument("--resume", action="store_true", help="Skip runs whose JSON already exists")
     parser.add_argument("--write-history-csv", action="store_true", help="Extract and save per-run history CSV")
     parser.add_argument("--summary-csv", default=None, help="Optional path for a summary CSV")
@@ -271,6 +328,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         procs=list(args.procs),
         hidden=args.hidden,
         lr=args.lr,
+        lr_decay=args.lr_decay,
+        lr_decay_steps=args.lr_decay_steps,
         iters=args.iters,
         eval_every=args.eval_every,
         seed=args.seed,
@@ -322,4 +381,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
