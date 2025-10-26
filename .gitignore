@@ -1,1 +1,7 @@
 nytaxi2022.csv
+results/
+*.log
+*.pyc
+__pycache__/
+data_preprocessed_enhanced
+training_history.json
